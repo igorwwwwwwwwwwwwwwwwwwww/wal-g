@@ -18,7 +18,7 @@ import (
 
 const composeChunkLimit = 32
 
-func NewFolder(bucket *gcs.BucketHandle, path string, encryptionKey []byte, config *Config) *Folder {
+func NewFolder(bucket, tmpBucket *gcs.BucketHandle, path string, encryptionKey []byte, config *Config) *Folder {
 	// Trim leading slash because there's no difference between absolute and relative paths in GCS.
 	path = strings.TrimPrefix(path, "/")
 
@@ -27,6 +27,7 @@ func NewFolder(bucket *gcs.BucketHandle, path string, encryptionKey []byte, conf
 
 	return &Folder{
 		bucket:        bucket,
+		tmpBucket:     tmpBucket,
 		path:          path,
 		encryptionKey: encryptionKeyCopy,
 		config:        config,
@@ -37,6 +38,7 @@ func NewFolder(bucket *gcs.BucketHandle, path string, encryptionKey []byte, conf
 // TODO: Unit tests
 type Folder struct {
 	bucket        *gcs.BucketHandle
+	tmpBucket     *gcs.BucketHandle
 	path          string
 	encryptionKey []byte
 	config        *Config
@@ -49,6 +51,22 @@ func (folder *Folder) GetPath() string {
 // BuildObjectHandle creates a new object handle.
 func (folder *Folder) BuildObjectHandle(path string) *gcs.ObjectHandle {
 	objectHandle := folder.bucket.Object(path)
+
+	if len(folder.encryptionKey) != 0 {
+		objectHandle = objectHandle.Key(folder.encryptionKey)
+	}
+
+	return objectHandle
+}
+
+// BuildTmpObjectHandle creates a new tmp object handle.
+func (folder *Folder) BuildTmpObjectHandle(path string) *gcs.ObjectHandle {
+	bucket := folder.bucket
+	if folder.tmpBucket != nil {
+		bucket = folder.tmpBucket
+	}
+
+	objectHandle := bucket.Object(path)
 
 	if len(folder.encryptionKey) != 0 {
 		objectHandle = objectHandle.Key(folder.encryptionKey)
@@ -76,6 +94,7 @@ func (folder *Folder) ListFolder() (objects []storage.Object, subFolders []stora
 				subFolders = append(subFolders,
 					NewFolder(
 						folder.bucket,
+						folder.tmpBucket,
 						objAttrs.Prefix,
 						folder.encryptionKey,
 						folder.config,
@@ -130,6 +149,7 @@ func (folder *Folder) Exists(objectRelativePath string) (bool, error) {
 func (folder *Folder) GetSubFolder(subFolderRelativePath string) storage.Folder {
 	return NewFolder(
 		folder.bucket,
+		folder.tmpBucket,
 		folder.joinPath(folder.path, subFolderRelativePath),
 		folder.encryptionKey,
 		folder.config,
@@ -156,7 +176,7 @@ func (folder *Folder) PutObject(name string, content io.Reader) error {
 func (folder *Folder) PutObjectWithContext(ctx context.Context, name string, content io.Reader) error {
 	tracelog.DebugLogger.Printf("Put %v into %v\n", name, folder.path)
 	objectPath := folder.joinPath(folder.path, name)
-	object := folder.BuildObjectHandle(objectPath)
+	object := folder.BuildTmpObjectHandle(objectPath)
 
 	ctx, cancel := folder.createTimeoutContext(ctx)
 	defer cancel()
@@ -166,7 +186,7 @@ func (folder *Folder) PutObjectWithContext(ctx context.Context, name string, con
 
 	for {
 		tmpChunkName := folder.joinPath(name+"_chunks", "chunk"+strconv.Itoa(chunkNum))
-		objectChunk := folder.BuildObjectHandle(folder.joinPath(folder.path, tmpChunkName))
+		objectChunk := folder.BuildTmpObjectHandle(folder.joinPath(folder.path, tmpChunkName))
 		chunkUploader := NewUploader(objectChunk, folder.config.Uploader)
 		dataChunk := chunkUploader.allocateBuffer()
 
@@ -202,7 +222,7 @@ func (folder *Folder) PutObjectWithContext(ctx context.Context, name string, con
 		if len(tmpChunks) == composeChunkLimit {
 			// Since there is a limit to the number of components that can be composed in a single operation, merge chunks partially.
 			compositeChunkName := folder.joinPath(name+"_chunks", "composite"+strconv.Itoa(chunkNum))
-			compositeChunk := folder.BuildObjectHandle(folder.joinPath(folder.path, compositeChunkName))
+			compositeChunk := folder.BuildTmpObjectHandle(folder.joinPath(folder.path, compositeChunkName))
 
 			tracelog.DebugLogger.Printf("Compose temporary chunks into an intermediate chunk %v\n", compositeChunkName)
 
@@ -220,12 +240,48 @@ func (folder *Folder) PutObjectWithContext(ctx context.Context, name string, con
 		return fmt.Errorf("compose GCS temporary chunks into an object: %w", err)
 	}
 
+	// if we have a tmp bucket configured, copy from tmp to dst
+	// and then delete from tmp
+	if folder.tmpBucket != nil {
+		tracelog.DebugLogger.Printf("Move composed file %v from tmp to dst bucket\n", object.ObjectName())
+
+		dstObject := folder.BuildObjectHandle(objectPath)
+
+		_, err := dstObject.CopierFrom(object).Run(ctx)
+		if err != nil {
+			return fmt.Errorf("copy GCS object %q/%q to %q/%q: %w", object.BucketName(), object.ObjectName(), dstObject.BucketName(), dstObject.ObjectName(), err)
+		}
+
+		err = object.Delete(ctx)
+		if err != nil {
+			return fmt.Errorf("delete GCS object %q/%q: %w", object.BucketName(), object.ObjectName(), err)
+		}
+	}
+
 	tracelog.DebugLogger.Printf("Put %v done\n", name)
 
 	return nil
 }
 
 func (folder *Folder) CopyObject(srcPath string, dstPath string) error {
+	if exists, err := folder.Exists(srcPath); !exists {
+		if err == nil {
+			return storage.NewObjectNotFoundError(srcPath)
+		}
+		return fmt.Errorf("check the existence of %q for copying in GCS: %w", srcPath, err)
+	}
+	source := path.Join(folder.path, srcPath)
+	dst := path.Join(folder.path, dstPath)
+
+	ctx := context.Background()
+	_, err := folder.bucket.Object(dst).CopierFrom(folder.bucket.Object(source)).Run(ctx)
+	if err != nil {
+		return fmt.Errorf("copy GCS object %q to %q: %w", srcPath, dstPath, err)
+	}
+	return nil
+}
+
+func (folder *Folder) CopyObjectFromTmp(srcPath string, dstPath string) error {
 	if exists, err := folder.Exists(srcPath); !exists {
 		if err == nil {
 			return storage.NewObjectNotFoundError(srcPath)

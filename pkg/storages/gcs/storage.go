@@ -21,6 +21,7 @@ type Config struct {
 	Secrets         *Secrets `json:"-"`
 	RootPath        string
 	Bucket          string
+	TmpBucket       string
 	NormalizePrefix bool
 	ContextTimeout  time.Duration
 	Uploader        *UploaderConfig
@@ -44,7 +45,12 @@ func NewStorage(config *Config, rootWraps ...storage.WrapRootFolder) (*Storage, 
 	}
 	bucket := client.Bucket(config.Bucket)
 
-	var folder storage.Folder = NewFolder(bucket, config.RootPath, config.Secrets.EncryptionKey, config)
+	var tmpBucket *gcs.BucketHandle
+	if config.TmpBucket != "" {
+		tmpBucket = client.Bucket(config.TmpBucket)
+	}
+
+	var folder storage.Folder = NewFolder(bucket, tmpBucket, config.RootPath, config.Secrets.EncryptionKey, config)
 
 	for _, wrap := range rootWraps {
 		folder = wrap(folder)
